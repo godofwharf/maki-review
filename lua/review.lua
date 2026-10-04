@@ -10,7 +10,12 @@
 --   * Tab cycles the left panels; Enter/l focuses the diff, h/Esc goes back.
 --     In the diff: `c` comments the current line, `v` selects a range first,
 --     `d` deletes a comment.
---   * `s` submits all comments to a new focused maki session that fixes them.
+--   * Comments persist in SQLite (review_store.lua) per repo/worktree/branch,
+--     with statuses (open/in_progress/resolved/stale/wontfix); agents work
+--     them through the review_* tools (review_tools.lua). Comments pane:
+--     x resolve, o reopen, w won't fix, e edit, d delete, h hide closed.
+--   * `R` opens the review picker (all branches/worktrees of the repo).
+--   * `s` sends the open comments to a new focused maki session.
 --
 -- After every turn, a status flash reminds you when files changed.
 --
@@ -34,15 +39,110 @@ local DEL_TINT = { "#f85149", 0.18 }
 local SEL_TINT = { "#58a6ff", 0.30 }
 local COM_TINT = { "#e3b341", 0.22 }
 
--- One shared comment store per maki process, survives window close/reopen.
--- Entry: { file, text, anchor ("new"|"old"), new_start, new_end,
---          old_start, old_end, snippet }
-local comments = {}
+local store = require("review_store")
 
--- Diff layout, shared across reviews: false = unified, true = side by side.
-local split_view = false
--- Diff context, shared across reviews: false = hunks only, true = whole file.
-local full_file = false
+-- Comments live in SQLite (see review_store.lua), scoped by repo + worktree
+-- + branch. `all_comments` mirrors the review currently shown; `comments` is
+-- the visible subset (closed ones hidden when `hide_closed`).
+-- UI entry: { id, file, commit, text, anchor ("new"|"old"), new_start,
+--   new_end, old_start, old_end, snippet, status, author_kind, author_id,
+--   version, resolution_note, ... } (plus every raw DB column).
+local comments = {}
+local all_comments = {}
+
+-- UI prefs, persisted in the prefs table.
+local split_view = false -- false = unified, true = side by side
+local full_file = false -- false = hunks only, true = whole file
+local hide_closed = false -- hide resolved / stale / wontfix comments
+local prefs_loaded = false
+
+local STATUS_BADGE = {
+  open = { "●", "warning" },
+  in_progress = { "◐", "accent" },
+  resolved = { "✓", "diff_new" },
+  stale = { "~", "dim" },
+  wontfix = { "✗", "dim" },
+}
+
+local function load_prefs()
+  if prefs_loaded then
+    return
+  end
+  local p = store.get_prefs()
+  if p then
+    split_view = p.split_view == "true"
+    full_file = p.full_file == "true"
+    hide_closed = p.hide_closed == "true"
+  end
+  prefs_loaded = true
+end
+
+local function save_pref(key, value)
+  local ok, err = store.set_pref(key, value and "true" or "false")
+  if not ok then
+    maki.log.warn("review: saving pref " .. key .. " failed: " .. tostring(err))
+  end
+end
+
+local function active_count()
+  local n = 0
+  for _, c in ipairs(all_comments) do
+    if store.ACTIVE[c.status] then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local function to_ui(row)
+  row.file = row.file_path
+  row.commit = row.target_kind == "commit" and row.target_sha or nil
+  row.text = row.body
+  row.anchor = row.side
+  if row.anchor == "old" and not row.old_start then
+    row.old_start, row.old_end = row.span_from, row.span_to or row.span_from
+  elseif row.anchor ~= "old" and not row.new_start then
+    row.new_start, row.new_end = row.span_from, row.span_to or row.span_from
+  end
+  return row
+end
+
+local function apply_filter()
+  comments = {}
+  for _, c in ipairs(all_comments) do
+    if not (hide_closed and store.CLOSED[c.status]) then
+      comments[#comments + 1] = c
+    end
+  end
+end
+
+-- Reloads state.review and its comments from the store.
+local function reload_comments(state)
+  all_comments = {}
+  if state and state.review then
+    local r = store.get_review(state.review.id)
+    if r then
+      state.review = r
+    end
+    local rows, err = store.list_comments(state.review.id)
+    if not rows then
+      maki.ui.flash("review db: " .. tostring(err))
+      rows = {}
+    end
+    for _, row in ipairs(rows) do
+      all_comments[#all_comments + 1] = to_ui(row)
+    end
+    state.readonly = not store.same_scope(state.review, state.scope)
+      or state.review.status == "deleted"
+  else
+    state.readonly = false
+  end
+  apply_filter()
+end
+
+local function human(state)
+  return { kind = "human", id = state.scope.user }
+end
 
 --- shell helpers -----------------------------------------------------------
 
@@ -379,6 +479,11 @@ local function make_comment(change, dlines, from, to, text)
 end
 
 local function line_range_label(c)
+  if c.anchor == "old" and not c.old_start then
+    c.old_start, c.old_end = c.span_from or 0, c.span_to or c.span_from or 0
+  elseif c.anchor ~= "old" and not c.new_start then
+    c.new_start, c.new_end = c.span_from or 0, c.span_to or c.span_from or 0
+  end
   if c.anchor == "old" then
     if c.old_start == c.old_end then
       return "removed line " .. c.old_start
@@ -393,9 +498,9 @@ end
 
 --- submit ------------------------------------------------------------------
 
-local function build_prompt()
+local function build_prompt(state, active)
   local by_file, order = {}, {}
-  for _, c in ipairs(comments) do
+  for _, c in ipairs(active) do
     if not by_file[c.file] then
       by_file[c.file] = {}
       order[#order + 1] = c.file
@@ -404,29 +509,38 @@ local function build_prompt()
   end
 
   local p = {
-    "I reviewed changes in this repository and left review comments. Comments refer either",
-    "to the uncommitted diff vs HEAD, or to a specific commit's diff (noted as `commit <sha>`).",
-    "Address every comment: apply the requested fix directly on the current working tree.",
-    "If a comment is a question, answer it and apply any change the answer implies.",
-    "Line numbers refer to the file content on the commented side of the diff",
+    "I reviewed changes in this repository (branch `" .. state.review.branch .. "`) and left",
+    "review comments. They are stored persistently and shared with other agents, so use the",
+    "review tools to coordinate:",
+    "",
+    "- `review_list_comments` to see what is open, `review_get_comment` for details/history.",
+    "- `review_claim_comment` BEFORE working on a comment (skip it if someone else holds it).",
+    "- Apply the fix on the current working tree, then `review_resolve_comment` with a short",
+    "  note (and the commit sha if you committed).",
+    "- `review_mark_stale` if the code no longer matches the comment; `review_release_comment`",
+    "  if you give up on one.",
+    "",
+    "Comments refer either to the uncommitted diff vs HEAD, or to a specific commit's diff",
+    "(noted as `commit <sha>`). If a comment is a question, answer it and apply any change the",
+    "answer implies. Line numbers refer to the file content on the commented side of the diff",
     "(\"removed\" lines refer to the pre-change file).",
     "",
   }
   for _, file in ipairs(order) do
     p[#p + 1] = "## " .. file
-    for i, c in ipairs(by_file[file]) do
+    for _, c in ipairs(by_file[file]) do
       p[#p + 1] = ""
       local where = line_range_label(c)
       if c.commit then
         where = where .. ", commit " .. c.commit
       end
-      p[#p + 1] = "### Comment " .. i .. " (" .. where .. ")"
+      p[#p + 1] = "### Comment `" .. c.id .. "` (" .. where .. ", " .. c.status .. ")"
       for cline in (c.text .. "\n"):gmatch("(.-)\n") do
         p[#p + 1] = "> " .. cline
       end
       p[#p + 1] = ""
       p[#p + 1] = "```diff"
-      p[#p + 1] = c.snippet
+      p[#p + 1] = c.snippet or ""
       p[#p + 1] = "```"
     end
     p[#p + 1] = ""
@@ -435,26 +549,32 @@ local function build_prompt()
 end
 
 local function submit(state)
-  if #comments == 0 then
-    maki.ui.flash("No review comments yet — press c on a diff line first")
+  local active = {}
+  for _, c in ipairs(all_comments) do
+    if c.status == "open" then
+      active[#active + 1] = c
+    end
+  end
+  if not state.review or #active == 0 then
+    maki.ui.flash("No open review comments — press c on a diff line first")
     return false
   end
-  local n = #comments
-  local prompt = build_prompt()
+  if state.readonly then
+    maki.ui.flash("Read-only review (other branch/worktree) — not submitting")
+    return false
+  end
+  local prompt = build_prompt(state, active)
   local _, err = maki.session.new({ prompt = prompt, focus = true })
   if err then
     maki.ui.flash("Failed to start session: " .. err)
     return false
   end
-  comments = {}
-  if state then
-    for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin" }) do
-      if state[w] then
-        state[w]:close()
-      end
+  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin", "pwin" }) do
+    if state[w] then
+      state[w]:close()
     end
   end
-  maki.ui.flash("Sent " .. n .. " comment(s) to a new session")
+  maki.ui.flash("Sent " .. #active .. " comment(s) to a new session")
   return true
 end
 
@@ -771,23 +891,37 @@ local function render_comment_list(state)
   local width = math.max(state.lwidth, 20)
   local active = state.pane == "comments" and not state.centry
   local lines, row_map = {}, {}
+  if state.readonly and state.review then
+    lines[#lines + 1] = {
+      { "  read-only: " .. state.review.branch .. " (" .. state.review.status .. ")", "dim" },
+    }
+  end
   if #comments == 0 then
-    lines[#lines + 1] = { { "  No comments yet.", "dim" } }
-    lines[#lines + 1] = { { "  Press c on a diff line.", "dim" } }
+    if #all_comments > 0 then
+      lines[#lines + 1] = { { "  All comments closed (h shows them).", "dim" } }
+    else
+      lines[#lines + 1] = { { "  No comments yet.", "dim" } }
+      lines[#lines + 1] = { { "  Press c on a diff line.", "dim" } }
+    end
   end
   for i, c in ipairs(comments) do
-    local ln = c.anchor == "old" and c.old_start or c.new_start
+    local ln = (c.anchor == "old" and c.old_start or c.new_start) or c.span_from
     local name = c.file:match("([^/]+)$") or c.file
     local loc = name .. ":" .. tostring(ln or "?")
     if c.commit then
       loc = loc .. " @" .. c.commit
     end
     loc = fit_path(loc, math.max(width - 4, 8))
+    local badge = STATUS_BADGE[c.status] or STATUS_BADGE.open
+    local closed = store.CLOSED[c.status]
     local spans = {
-      { " " .. COMMENT_MARK, "warning" },
-      { loc, "item" },
+      { " " .. badge[1] .. " ", badge[2] },
+      { loc, closed and "dim" or "item" },
     }
-    local avail = width - 3 - display_len(loc) - 2
+    if c.author_kind == "agent" then
+      spans[#spans + 1] = { " [agent]", "dim" }
+    end
+    local avail = width - 3 - spans_len(spans) - 2
     if avail > 4 then
       local preview = c.text:gsub("%s+", " ")
       if display_len(preview) > avail then
@@ -802,7 +936,7 @@ local function render_comment_list(state)
         lines[#lines] = pad_spans(restyle(spans, "selected"), width, "selected")
       else
         local marked = restyle(spans, "active")
-        marked[1] = { "▎" .. COMMENT_MARK, "warning" }
+        marked[1] = { "▎" .. badge[1] .. " ", badge[2] }
         lines[#lines] = marked
       end
     end
@@ -830,17 +964,38 @@ local function push_editor(state, lines, width)
   return editor_row
 end
 
+-- One-line "status · author · note" summary for a comment.
+local function comment_meta(c)
+  local parts = { ((c.status or "open"):gsub("_", " ")) }
+  parts[#parts + 1] = (c.author_kind == "agent" and "agent " or "") .. tostring(c.author_id or "?")
+  if c.status == "in_progress" and c.claimed_by then
+    parts[#parts + 1] = "claimed by " .. c.claimed_by
+  end
+  return table.concat(parts, " · ")
+end
+
 -- Appends comment `c` as a full-width tinted block.
 local function push_comment(lines, c, width, tint)
+  local closed = store.CLOSED[c.status]
   local cbg = tint.com
-  local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
-  local txt = cbg and { bg = cbg, bold = true } or "warning"
-  local hdr = { { "    ┏ ", bar }, { "● Comment", bar } }
+  local bar = { fg = closed and "#8b949e" or COM_TINT[1], bg = cbg, bold = not closed }
+  local txt = cbg and { bg = cbg, bold = not closed, fg = closed and "#8b949e" or nil }
+    or (closed and "dim" or "warning")
+  local badge = STATUS_BADGE[c.status] or STATUS_BADGE.open
+  local hdr = {
+    { "    ┏ ", bar },
+    { badge[1] .. " Comment", bar },
+    { "  " .. comment_meta(c), cbg and { bg = cbg, fg = "#8b949e" } or "dim" },
+  }
   if cbg then
     pad_spans(hdr, width, { bg = cbg })
   end
   lines[#lines + 1] = hdr
-  for _, cl in ipairs(wrap(c.text, math.max(width - 10, 20))) do
+  local body = c.text
+  if closed and c.resolution_note and c.resolution_note ~= "" then
+    body = body .. "\n→ " .. c.resolution_note
+  end
+  for _, cl in ipairs(wrap(body, math.max(width - 10, 20))) do
     local cspans = { { COMMENT_BAR, bar }, { cl, txt } }
     if cbg then
       pad_spans(cspans, width, { bg = cbg })
@@ -1138,22 +1293,37 @@ local function render_comment_detail(state)
   if c.commit then
     where = where .. "  ·  commit " .. c.commit
   end
+  local badge = STATUS_BADGE[c.status] or STATUS_BADGE.open
   lines[#lines + 1] = { { "", "" } }
   lines[#lines + 1] = { { " " .. c.file, "accent" } }
-  lines[#lines + 1] = { { " " .. where, "dim" } }
+  lines[#lines + 1] = { { " " .. where .. "  ·  id " .. tostring(c.id), "dim" } }
+  lines[#lines + 1] = {
+    { " " .. badge[1] .. " " .. comment_meta(c), badge[2] },
+  }
   lines[#lines + 1] = { { "", "" } }
-  local cbg = tint.com
-  local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
-  local txt = cbg and { bg = cbg, bold = true } or "warning"
-  for _, cl in ipairs(wrap(c.text, math.max(width - 8, 20))) do
-    local spans = { { " ┃ ", bar }, { cl, txt } }
-    if cbg then
-      pad_spans(spans, width, { bg = cbg })
+  local editor_row
+  if state.centry and state.centry.detail then
+    editor_row = push_editor(state, lines, width)
+  else
+    local cbg = tint.com
+    local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
+    local txt = cbg and { bg = cbg, bold = true } or "warning"
+    for _, cl in ipairs(wrap(c.text, math.max(width - 8, 20))) do
+      local spans = { { " ┃ ", bar }, { cl, txt } }
+      if cbg then
+        pad_spans(spans, width, { bg = cbg })
+      end
+      lines[#lines + 1] = spans
     end
-    lines[#lines + 1] = spans
+  end
+  if c.resolution_note and c.resolution_note ~= "" and store.CLOSED[c.status] then
+    lines[#lines + 1] = { { "", "" } }
+    for _, rl in ipairs(wrap("→ " .. c.resolution_note, math.max(width - 4, 20))) do
+      lines[#lines + 1] = { { " " .. rl, "diff_new" } }
+    end
   end
   lines[#lines + 1] = { { "", "" } }
-  for sl in (c.snippet .. "\n"):gmatch("(.-)\n") do
+  for sl in ((c.snippet or "") .. "\n"):gmatch("(.-)\n") do
     local ch1 = sl:sub(1, 1)
     local style = "item"
     if sl:match("^@@") then
@@ -1165,7 +1335,31 @@ local function render_comment_detail(state)
     end
     lines[#lines + 1] = { { " " .. sl, style } }
   end
+
+  -- History, cached per comment version to avoid a sqlite call per redraw.
+  state.events_cache = state.events_cache or {}
+  local key = tostring(c.id) .. ":" .. tostring(c.version)
+  local evs = state.events_cache[key]
+  if evs == nil then
+    evs = store.events(c.id) or {}
+    state.events_cache[key] = evs
+  end
+  if #evs > 0 then
+    lines[#lines + 1] = { { "", "" } }
+    lines[#lines + 1] = { { " History", "accent" } }
+    local now = (os and os.time) and os.time() or 0
+    for _, e in ipairs(evs) do
+      local age = maki.ui.humantime(math.max(now - (tonumber(e.at) or now), 0))
+      local trans = (e.from_status and (e.from_status .. " → ") or "") .. tostring(e.to_status)
+      local txt = "  " .. age .. " ago  " .. trans .. "  " .. tostring(e.actor_id)
+      if e.note and e.note ~= "" then
+        txt = txt .. "  — " .. e.note:gsub("%s+", " ")
+      end
+      lines[#lines + 1] = { { txt, "dim" } }
+    end
+  end
   state.rbuf:set_lines(lines)
+  return editor_row
 end
 
 -- Renders a left panel and clamps its cursor to a mapped row, re-rendering
@@ -1235,7 +1429,7 @@ local function redraw(state)
   if state.src == "commits" and not state.commit then
     render_commit_info(state)
   elseif state.src == "comments" then
-    render_comment_detail(state)
+    editor_row = render_comment_detail(state)
   else
     drow_map, editor_row = render_diff(state)
   end
@@ -1253,7 +1447,7 @@ local function redraw(state)
     end
   end
 
-  local diff_active = state.pane == "diff" or state.centry ~= nil
+  local diff_active = state.pane == "diff" or (state.centry ~= nil and not state.centry.detail)
 
   if state.pane ~= "files" or state.centry then
     dim_panel(state.fbuf, state.fcursor)
@@ -1280,13 +1474,22 @@ local function redraw(state)
     })
   end
 
+  local nopen = 0
+  for _, c in ipairs(all_comments) do
+    if c.status == "open" then
+      nopen = nopen + 1
+    end
+  end
+  local submit_hint = { "s", "submit " .. nopen }
+
   panel_cfg(
     state.fwin,
     " Files (" .. #state.wchanges .. ") ",
     state.pane == "files" and not state.centry,
     {
       { "Enter", "diff" },
-      { "s", "submit " .. #comments },
+      submit_hint,
+      { "R", "reviews" },
       { "Esc", "close" },
     }
   )
@@ -1308,11 +1511,16 @@ local function redraw(state)
 
   panel_cfg(
     state.mwin,
-    " Comments (" .. #comments .. ") ",
+    " Comments (" .. active_count() .. "/" .. #all_comments .. ") ",
     state.pane == "comments" and not state.centry,
     {
+      { "x", "resolve" },
+      { "o", "reopen" },
+      { "w", "wontfix" },
+      { "e", "edit" },
       { "d", "delete" },
-      { "s", "submit " .. #comments },
+      { "h", hide_closed and "show closed" or "hide closed" },
+      submit_hint,
     }
   )
 
@@ -1344,7 +1552,7 @@ local function redraw(state)
         { "c", "comment" },
         { "v", state.vstart and "cancel select" or "select" },
         { "d", "delete" },
-        { "s", "submit " .. #comments },
+        submit_hint,
         { "Esc", "back" },
       } or { { "Enter", "diff" } }),
   })
@@ -1363,7 +1571,14 @@ local function redraw(state)
   if state.vstart then
     hints[#hints + 1] = { "v", "selecting" }
   end
-  hints[#hints + 1] = { tostring(#comments), #comments == 1 and "comment" or "comments" }
+  local nact = active_count()
+  hints[#hints + 1] = { tostring(nact), nact == 1 and "active comment" or "active comments" }
+  if state.review then
+    hints[#hints + 1] = { "review", state.review.branch .. " (" .. state.review.status .. ")" }
+  end
+  if state.readonly then
+    hints[#hints + 1] = { "ro", "read-only" }
+  end
   hints[#hints + 1] = { "?", "help" }
   local bar = { { " REVIEW ", { bold = true, reversed = true } } }
   for _, h in ipairs(hints) do
@@ -1454,6 +1669,8 @@ end
 
 local function refresh(state)
   state.cache = {}
+  state.events_cache = {}
+  reload_comments(state)
   state.wchanges = git_changes() or state.wchanges
   state.commits = git_log() or state.commits
   if state.commit then
@@ -1529,18 +1746,157 @@ local function leave_commit(state)
   redraw(state)
 end
 
+--- persistence -------------------------------------------------------------
+
+local function writable(state)
+  if state.readonly then
+    maki.ui.flash("Read-only: this review belongs to another branch/worktree (R to switch)")
+    return false
+  end
+  return true
+end
+
+local function is_own(state, c)
+  return c.author_kind == "human" and c.author_id == state.scope.user
+end
+
+local function can_edit(state, c)
+  if not is_own(state, c) then
+    maki.ui.flash("Only your own comments can be edited")
+    return false
+  end
+  if not store.ACTIVE[c.status] then
+    maki.ui.flash("Comment is " .. c.status .. " — reopen (o) it first")
+    return false
+  end
+  return true
+end
+
+-- Hard-deletes one of the user's own open comments. Returns true on success.
+local function delete_comment_record(state, c)
+  if not writable(state) then
+    return false
+  end
+  if not is_own(state, c) or c.status ~= "open" then
+    maki.ui.flash("Only your own open comments can be deleted — use w (won't fix) instead")
+    return false
+  end
+  local ok, err = store.delete_comment(c.id, human(state))
+  if ok == nil then
+    maki.ui.flash("review db: " .. tostring(err))
+  elseif not ok then
+    maki.ui.flash("Comment changed elsewhere — reloaded")
+  else
+    maki.ui.flash("Comment deleted")
+  end
+  reload_comments(state)
+  return ok == true
+end
+
+-- Returns an open review for the current scope to add comments to,
+-- reopening the displayed one if it was auto-resolved.
+local function ensure_review(state)
+  local r = state.review
+  if r and r.status == "open" and store.same_scope(r, state.scope) then
+    return r
+  end
+  if r and r.status == "resolved" and store.same_scope(r, state.scope) then
+    local rr = store.reopen_review(r.id)
+    if rr and rr.status == "open" then
+      state.review = rr
+      return rr
+    end
+  end
+  local nr, err = store.open_review(state.scope, human(state), true)
+  if not nr then
+    maki.ui.flash("review db: " .. tostring(err))
+    return nil
+  end
+  state.review = nr
+  return nr
+end
+
+-- Git blob id of the commented file version (evidence for staleness checks).
+local function blob_sha(c)
+  local cmd
+  if c.commit then
+    local rev = c.anchor == "old" and (c.commit .. "^") or c.commit
+    cmd = "git rev-parse " .. sh_quote(rev .. ":" .. c.file) .. " 2>/dev/null"
+  elseif c.anchor == "old" then
+    cmd = "git rev-parse " .. sh_quote("HEAD:" .. c.file) .. " 2>/dev/null"
+  else
+    cmd = "git hash-object -- " .. sh_quote(c.file) .. " 2>/dev/null"
+  end
+  local out = run(cmd)
+  return out and out:match("^%s*(%x+)%s*$")
+end
+
 local function delete_selected_comment(state)
   local idx = state.mrow_map and state.mrow_map[state.mcursor]
   if not idx or not comments[idx] then
     maki.ui.flash("No comment selected")
     return
   end
-  table.remove(comments, idx)
-  maki.ui.flash("Comment deleted")
-  if state.mcursor > 1 then
+  if delete_comment_record(state, comments[idx]) and state.mcursor > 1 then
     state.mcursor = state.mcursor - 1
   end
   load_preview(state)
+  redraw(state)
+end
+
+local STATUS_VERB = { resolved = "resolved", open = "reopened", wontfix = "marked won't fix" }
+
+-- Sets the status of the comment selected in the Comments pane.
+local function set_selected_status(state, to)
+  local c = comments[state.mrow_map and state.mrow_map[state.mcursor]]
+  if not c then
+    maki.ui.flash("No comment selected")
+    return
+  end
+  if not writable(state) then
+    return
+  end
+  if c.status == to then
+    maki.ui.flash("Already " .. to)
+    return
+  end
+  local ok, info = store.set_status(c.id, to, human(state), { version = c.version })
+  if ok == nil then
+    maki.ui.flash("review db: " .. tostring(info))
+  elseif not ok then
+    maki.ui.flash("Comment changed elsewhere — reloaded")
+  else
+    local msg = "Comment " .. STATUS_VERB[to]
+    if info and info.review_status == "resolved" then
+      msg = msg .. " — review resolved"
+    end
+    maki.ui.flash(msg)
+  end
+  reload_comments(state)
+  redraw(state)
+end
+
+-- Opens the editor for the selected comment, in the Comment detail pane.
+local function edit_selected(state)
+  local c = comments[state.mrow_map and state.mrow_map[state.mcursor]]
+  if not c then
+    maki.ui.flash("No comment selected")
+    return
+  end
+  if not writable(state) then
+    return
+  end
+  if not can_edit(state, c) then
+    return
+  end
+  local input = TextInput.new()
+  input:insert_text(c.text)
+  state.centry = {
+    input = input,
+    existing = c,
+    detail = true,
+    label = line_range_label(c),
+  }
   redraw(state)
 end
 
@@ -1725,6 +2081,9 @@ end
 --- comment editing ---------------------------------------------------------
 
 local function open_comment_editor(state)
+  if not writable(state) then
+    return
+  end
   local at = state.drow_map[state.dcursor]
   local dl = state.dlines and state.dlines[at]
   if not dl or dl.kind == "hunk" then
@@ -1741,7 +2100,12 @@ local function open_comment_editor(state)
   end
 
   local input = TextInput.new()
-  local existing, existing_idx = comment_at(state.change, state.dlines[to])
+  local existing = comment_at(state.change, state.dlines[to])
+  -- Only the author's own active comment is edited in place; on anything
+  -- else (closed, or someone else's) c starts a new comment.
+  if existing and not (is_own(state, existing) and store.ACTIVE[existing.status]) then
+    existing = nil
+  end
   local label
   if existing then
     input:insert_text(existing.text)
@@ -1756,7 +2120,7 @@ local function open_comment_editor(state)
     from = from,
     to = to,
     at = at,
-    existing_idx = existing_idx,
+    existing = existing,
     label = label,
   }
   state.vstart = nil
@@ -1771,12 +2135,41 @@ local function save_comment(state)
     redraw(state)
     return
   end
-  if e.existing_idx then
-    comments[e.existing_idx].text = text
+  if e.existing then
+    local ok, err = store.edit_comment(e.existing.id, text, e.existing.version, human(state))
+    if ok == nil then
+      maki.ui.flash("review db: " .. tostring(err))
+    elseif not ok then
+      maki.ui.flash("Comment changed elsewhere — edit not saved, reloaded")
+    end
   else
-    comments[#comments + 1] =
-      make_comment(state.change, state.dlines, e.from, e.to, text)
+    local c = make_comment(state.change, state.dlines, e.from, e.to, text)
+    local review = ensure_review(state)
+    if review then
+      local side = c.anchor
+      local row, err = store.add_comment(review.id, {
+        file_path = c.file,
+        target_kind = c.commit and "commit" or "worktree",
+        target_sha = c.commit,
+        side = side,
+        span_from = side == "old" and c.old_start or c.new_start,
+        span_to = side == "old" and c.old_end or c.new_end,
+        snippet = c.snippet,
+        anchor = {
+          new_start = c.new_start,
+          new_end = c.new_end,
+          old_start = c.old_start,
+          old_end = c.old_end,
+        },
+        blob_sha = blob_sha(c),
+        body = text,
+      }, human(state))
+      if not row then
+        maki.ui.flash("Comment not saved: " .. tostring(err))
+      end
+    end
   end
+  reload_comments(state)
   redraw(state)
 end
 
@@ -1785,10 +2178,9 @@ local function delete_comment(state)
   if not dl then
     return
   end
-  local _, idx = comment_at(state.change, dl)
-  if idx then
-    table.remove(comments, idx)
-    maki.ui.flash("Comment deleted")
+  local c = comment_at(state.change, dl)
+  if c then
+    delete_comment_record(state, c)
     redraw(state)
   else
     maki.ui.flash("No comment on this line")
@@ -1902,7 +2294,8 @@ local HELP = {
       { "PgUp PgDn", "move one page" },
       { "g / Home", "jump to top" },
       { "G / End", "jump to bottom" },
-      { "s", "submit comments to a new session" },
+      { "s", "send open comments to a new session" },
+      { "R", "review picker (all branches / worktrees)" },
       { "q / Ctrl-C", "close review" },
     },
   },
@@ -1911,9 +2304,28 @@ local HELP = {
     {
       { "Enter / l / →", "open diff, expand dir, open commit" },
       { "h / ←", "collapse dir, leave commit" },
-      { "r", "refresh from git" },
-      { "d", "delete comment (Comments pane)" },
+      { "r", "refresh from git and the review db" },
       { "Esc", "leave commit, or close review" },
+    },
+  },
+  {
+    "Comments pane",
+    {
+      { "x", "resolve comment" },
+      { "o", "reopen comment" },
+      { "w", "mark won't fix" },
+      { "e", "edit your own comment" },
+      { "d", "delete your own open comment" },
+      { "h", "hide / show closed comments" },
+    },
+  },
+  {
+    "Review picker (R)",
+    {
+      { "Enter", "open review (other branches read-only)" },
+      { "r", "mark review resolved" },
+      { "D D", "soft-delete review" },
+      { "a", "show / hide resolved & deleted" },
     },
   },
   {
@@ -1926,7 +2338,7 @@ local HELP = {
       { "c / Enter", "comment on line or selection" },
       { "v", "start / cancel range selection" },
       { "Shift-↑ ↓", "select range (ends on next plain move)" },
-      { "d", "delete comment under cursor" },
+      { "d", "delete your own open comment under cursor" },
       { "h / ← / Esc", "cancel selection, or go back" },
     },
   },
@@ -1989,6 +2401,215 @@ local function open_help(state)
   })
 end
 
+--- review picker -----------------------------------------------------------
+
+local function branch_set()
+  local set = {}
+  local out = run("git for-each-ref --format='%(refname:short)' refs/heads") or ""
+  for b in out:gmatch("[^\n]+") do
+    set[b] = true
+  end
+  return set
+end
+
+local function close_picker(state)
+  if state.pwin then
+    state.pwin:close()
+    state.pwin = nil
+  end
+  state.picker = nil
+end
+
+local function picker_load(state)
+  local pk = state.picker
+  local rows, err = store.list_reviews({
+    repo_root = state.scope.repo_root,
+    include_hidden = pk.show_hidden,
+  })
+  if not rows then
+    maki.ui.flash("review db: " .. tostring(err))
+    rows = {}
+  end
+  local cur, rest, has_open_cur = {}, {}, false
+  for _, r in ipairs(rows) do
+    if store.same_scope(r, state.scope) then
+      cur[#cur + 1] = r
+      has_open_cur = has_open_cur or r.status == "open"
+    else
+      rest[#rest + 1] = r
+    end
+  end
+  local items = {}
+  if not has_open_cur then
+    items[1] = { current_new = true }
+  end
+  for _, r in ipairs(cur) do
+    items[#items + 1] = r
+  end
+  for _, r in ipairs(rest) do
+    items[#items + 1] = r
+  end
+  pk.items = items
+  pk.cursor = math.max(1, math.min(pk.cursor or 1, #items))
+end
+
+local function picker_render(state)
+  local pk = state.picker
+  local lines = {}
+  local now = (os and os.time) and os.time() or 0
+  for i, it in ipairs(pk.items) do
+    local spans
+    if it.current_new then
+      spans = {
+        { "  + ", "accent" },
+        { state.scope.branch, "item" },
+        { "  current branch — no open review", "dim" },
+      }
+    else
+      local st = it.status
+      local style = st == "open" and "warning" or (st == "resolved" and "diff_new" or "dim")
+      local age = maki.ui.humantime(math.max(now - (tonumber(it.updated_at) or now), 0))
+      local wt = it.worktree_path:match("([^/]+)$") or it.worktree_path
+      spans = {
+        { store.same_scope(it, state.scope) and "  ▸ " or "    ", "accent" },
+        { it.branch, "item" },
+        { "  " .. st, style },
+        { "  " .. tostring(it.n_active) .. "/" .. tostring(it.n_total) .. " active", "dim" },
+        { "  " .. age .. " ago", "dim" },
+        { "  " .. wt, "dim" },
+      }
+      if not pk.branches[it.branch] and not it.branch:match("^detached@") then
+        spans[#spans + 1] = { "  (branch gone)", "diff_old" }
+      end
+      if state.review and state.review.id == it.id then
+        spans[#spans + 1] = { "  [shown]", "accent" }
+      end
+    end
+    if i == pk.cursor then
+      spans = pad_spans(restyle(spans, "selected"), pk.width, "selected")
+    end
+    lines[#lines + 1] = spans
+  end
+  if #lines == 0 then
+    lines[1] = { { "  No reviews.", "dim" } }
+  end
+  pk.buf:set_lines(lines)
+  if state.pwin then
+    state.pwin:set_config({
+      footer = {
+        { "Enter", "open" },
+        { "r", "resolve" },
+        { "D", pk.confirm and "confirm delete" or "delete" },
+        { "a", pk.show_hidden and "hide closed" or "show all" },
+        { "Esc", "close" },
+      },
+    })
+    state.pwin:set_cursor(pk.cursor)
+  end
+end
+
+local function open_picker(state)
+  close_picker(state)
+  local sz = maki.ui.terminal_size()
+  local w = math.min(math.max(70, math.floor(sz.cols * 0.7)), sz.cols - 2)
+  local h = math.min(math.max(8, math.floor(sz.rows * 0.5)), sz.rows - 2)
+  state.picker = {
+    cursor = 1,
+    show_hidden = false,
+    buf = maki.ui.buf(),
+    width = w - 2,
+    branches = branch_set(),
+  }
+  picker_load(state)
+  for i, it in ipairs(state.picker.items) do
+    if state.review and it.id == state.review.id then
+      state.picker.cursor = i
+    end
+  end
+  local repo = state.scope.repo_root:match("([^/]+)$") or state.scope.repo_root
+  state.pwin = maki.ui.open_win(state.picker.buf, {
+    title = " Reviews · " .. repo .. " ",
+    title_pos = "center",
+    border = "double",
+    width = w,
+    height = h,
+    row = math.max(math.floor((sz.rows - h) / 2), 0),
+    col = math.max(math.floor((sz.cols - w) / 2), 0),
+    anchor = "NW",
+    zindex = 150,
+    focus = false,
+  })
+  picker_render(state)
+end
+
+-- Switches the main view to review `r` (nil = current scope, no review yet).
+local function show_review(state, r)
+  state.review = r
+  state.mcursor = 1
+  state.events_cache = {}
+  reload_comments(state)
+  redraw(state)
+  load_preview(state)
+  redraw(state)
+end
+
+-- Handles a key while the picker is open. Returns true when it closed.
+local function picker_key(state, key)
+  local pk = state.picker
+  local it = pk.items[pk.cursor]
+  local confirm = pk.confirm
+  pk.confirm = nil
+  if key == "<Esc>" or key == "q" or key == "R" then
+    close_picker(state)
+    return true
+  elseif key == "<Up>" or key == "k" then
+    pk.cursor = math.max(pk.cursor - 1, 1)
+  elseif key == "<Down>" or key == "j" then
+    pk.cursor = math.min(pk.cursor + 1, math.max(#pk.items, 1))
+  elseif key == "a" then
+    pk.show_hidden = not pk.show_hidden
+    picker_load(state)
+  elseif key == "<CR>" or key == "l" then
+    if not it then
+      return false
+    end
+    close_picker(state)
+    if it.current_new then
+      show_review(state, store.open_review(state.scope, nil, false))
+    else
+      show_review(state, it)
+      if state.readonly then
+        maki.ui.flash("Viewing " .. it.branch .. " read-only")
+      end
+    end
+    return true
+  elseif (key == "r" or key == "D") and it and not it.current_new then
+    local ok, err
+    if key == "r" then
+      ok, err = store.mark_review_resolved(it.id)
+    elseif confirm == it.id then
+      ok, err = store.soft_delete_review(it.id)
+    else
+      pk.confirm = it.id
+      maki.ui.flash("Press D again to delete review " .. it.branch)
+      picker_render(state)
+      return false
+    end
+    if ok == nil then
+      maki.ui.flash("review db: " .. tostring(err))
+    elseif ok then
+      maki.ui.flash(key == "r" and "Review marked resolved" or "Review deleted")
+    end
+    picker_load(state)
+    if state.review and state.review.id == it.id then
+      reload_comments(state)
+      redraw(state)
+    end
+  end
+  picker_render(state)
+  return false
+end
+
 --- main loop ---------------------------------------------------------------
 
 local function open_review()
@@ -2019,7 +2640,34 @@ local function open_review()
     fcollapsed = {},
     ccollapsed = {},
     cache = {},
+    events_cache = {},
   }
+
+  load_prefs()
+  local scope, serr = store.scope()
+  if not scope then
+    maki.ui.flash(tostring(serr))
+    return
+  end
+  state.scope = scope
+  local review, rerr = store.open_review(scope, nil, false)
+  if rerr then
+    maki.ui.flash("review db unavailable: " .. tostring(rerr))
+  end
+  if not review then
+    -- No open review: show the latest resolved one so its history is visible;
+    -- a new comment reopens it.
+    local rows = store.list_reviews({ scope = scope, include_hidden = true }) or {}
+    for _, r in ipairs(rows) do
+      if r.status == "resolved" then
+        review = r
+        break
+      end
+    end
+  end
+  state.review = review
+  reload_comments(state)
+
   open_windows(state)
   redraw(state) -- build row maps before the first preview
   for r = 1, state.fbuf:len() do
@@ -2045,6 +2693,7 @@ local function open_review()
       if sz.cols ~= state.term.cols or sz.rows ~= state.term.rows then
         local had_help = state.hwin ~= nil
         close_help(state)
+        close_picker(state)
         open_windows(state)
         if had_help then
           open_help(state)
@@ -2064,6 +2713,12 @@ local function open_review()
       continue
     end
     local key = ev.key
+
+    -- Review picker swallows keys while open.
+    if state.picker then
+      picker_key(state, key)
+      continue
+    end
 
     -- Help overlay swallows keys while open; ?/Esc/q close it.
     if state.hwin then
@@ -2130,7 +2785,7 @@ local function open_review()
         if state.pane == "commits" and not state.commit then
           enter_commit(state)
         elseif state.pane == "comments" then
-          maki.ui.flash("d deletes the selected comment")
+          maki.ui.flash("x resolve · o reopen · w won't fix · e edit · d delete")
         else
           local cursor, row_map = active_view(state)
           local sel = row_map[cursor]
@@ -2142,6 +2797,23 @@ local function open_review()
         end
       elseif key == "d" and state.pane == "comments" then
         delete_selected_comment(state)
+      elseif key == "x" and state.pane == "comments" then
+        set_selected_status(state, "resolved")
+      elseif key == "o" and state.pane == "comments" then
+        set_selected_status(state, "open")
+      elseif key == "w" and state.pane == "comments" then
+        set_selected_status(state, "wontfix")
+      elseif key == "e" and state.pane == "comments" then
+        edit_selected(state)
+      elseif key == "h" and state.pane == "comments" then
+        hide_closed = not hide_closed
+        save_pref("hide_closed", hide_closed)
+        apply_filter()
+        state.mcursor = 1
+        redraw(state)
+        maki.ui.flash(hide_closed and "Hiding closed comments" or "Showing all comments")
+      elseif key == "R" then
+        open_picker(state)
       elseif key == "r" then
         refresh(state)
       elseif key == "h" or key == "<Left>" then
@@ -2180,6 +2852,7 @@ local function open_review()
       elseif key == "f" then
         local cur = state.dlines and state.dlines[state.drow_map[state.dcursor] or 0]
         full_file = not full_file
+        save_pref("full_file", full_file)
         state.vstart = nil
         state.vshift = nil
         load_preview(state)
@@ -2197,6 +2870,7 @@ local function open_review()
         maki.ui.flash(full_file and "Showing whole file" or "Showing changed hunks only")
       elseif key == "t" then
         split_view = not split_view
+        save_pref("split_view", split_view)
         state.vstart = nil
         state.vshift = nil
         local anchor = state.drow_map[state.dcursor]
@@ -2234,6 +2908,7 @@ local function open_review()
   end
 
   close_help(state)
+  close_picker(state)
   for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin" }) do
     if state[w] then
       state[w]:close()
