@@ -19,7 +19,8 @@
 --     instead of relying on the host's `cursor_line`, because span
 --     backgrounds (diff tints) patch over the native highlight.
 --   * Only the Files window is ever focused; it receives all keys. The
---     "active pane" is plugin state, indicated by border style.
+--     "active pane" is plugin state, indicated by a double border, a ▶title◀
+--     marker, and dimmed text in the inactive left panels.
 
 local TextInput = require("maki.text_input")
 
@@ -37,6 +38,11 @@ local COM_TINT = { "#e3b341", 0.22 }
 -- Entry: { file, text, anchor ("new"|"old"), new_start, new_end,
 --          old_start, old_end, snippet }
 local comments = {}
+
+-- Diff layout, shared across reviews: false = unified, true = side by side.
+local split_view = false
+-- Diff context, shared across reviews: false = hunks only, true = whole file.
+local full_file = false
 
 --- shell helpers -----------------------------------------------------------
 
@@ -264,16 +270,17 @@ local function parse_diff(raw)
 end
 
 local function get_diff(change)
+  local ctx = full_file and "--unified=1000000 " or ""
   local cmd
   if change.commit then
-    cmd = "git show --no-color --format= "
+    cmd = "git show --no-color --format= " .. ctx
       .. change.commit
       .. " -- "
       .. sh_quote(change.path)
   elseif change.untracked then
-    cmd = "git diff --no-color --no-index -- /dev/null " .. sh_quote(change.path)
+    cmd = "git diff --no-color --no-index " .. ctx .. "-- /dev/null " .. sh_quote(change.path)
   else
-    cmd = "git diff --no-color HEAD -- " .. sh_quote(change.path)
+    cmd = "git diff --no-color " .. ctx .. "HEAD -- " .. sh_quote(change.path)
   end
   local raw, err = run(cmd)
   if not raw then
@@ -441,7 +448,7 @@ local function submit(state)
   end
   comments = {}
   if state then
-    for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
+    for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin" }) do
       if state[w] then
         state[w]:close()
       end
@@ -805,12 +812,214 @@ local function render_comment_list(state)
 end
 
 -- Renders the diff of state.change into rbuf.
+-- Appends the inline comment editor to `lines`; returns the editor's
+-- last row.
+local function push_editor(state, lines, width)
+  local editor_row
+  lines[#lines + 1] = {
+    { "    ┌ ", "accent" },
+    { "Comment (" .. state.centry.label .. ")", "accent" },
+    { "  Enter: save  Esc: cancel", "dim" },
+  }
+  local r = state.centry.input:render("    │ ", 6, math.max(width - 8, 20))
+  for _, l in ipairs(r.lines) do
+    lines[#lines + 1] = l
+    editor_row = #lines
+  end
+  lines[#lines + 1] = { { "    └", "accent" } }
+  return editor_row
+end
+
+-- Appends comment `c` as a full-width tinted block.
+local function push_comment(lines, c, width, tint)
+  local cbg = tint.com
+  local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
+  local txt = cbg and { bg = cbg, bold = true } or "warning"
+  local hdr = { { "    ┏ ", bar }, { "● Comment", bar } }
+  if cbg then
+    pad_spans(hdr, width, { bg = cbg })
+  end
+  lines[#lines + 1] = hdr
+  for _, cl in ipairs(wrap(c.text, math.max(width - 10, 20))) do
+    local cspans = { { COMMENT_BAR, bar }, { cl, txt } }
+    if cbg then
+      pad_spans(cspans, width, { bg = cbg })
+    end
+    lines[#lines + 1] = cspans
+  end
+end
+
+-- True when comment `c` ends on dline `i` (the next line is not covered).
+local function comment_ends_at(dlines, c, i)
+  local nxt = dlines[i + 1]
+  return not (nxt and nxt.kind ~= "hunk" and covers(c, nxt))
+end
+
+-- Cuts `spans` to at most `max` display columns; tabs become 4 spaces.
+local function truncate_spans(spans, max)
+  local out, used = {}, 0
+  for _, sp in ipairs(spans) do
+    if used >= max then
+      break
+    end
+    local t = sp[1]:gsub("\t", "    ")
+    local n = display_len(t)
+    if used + n > max then
+      t = maki.ui.truncate_text(t, max - used).head
+      n = display_len(t)
+    end
+    out[#out + 1] = { t, sp[2] }
+    used = used + n
+  end
+  return out
+end
+
+-- Gutter + code spans for dline `i`. `side` picks the line number shown
+-- ("old" | "new"); nil means unified (old for deletions, new otherwise).
+local function code_spans(state, i, side)
+  local dl = state.dlines[i]
+  local c = comment_at(state.change, dl)
+  local ln
+  if side == "old" then
+    ln = dl.old_ln
+  elseif side == "new" then
+    ln = dl.new_ln
+  else
+    ln = dl.kind == "del" and dl.old_ln or dl.new_ln
+  end
+  local sign = dl.kind == "add" and "+" or dl.kind == "del" and "-" or " "
+  local base = dl.kind == "add" and "diff_new"
+    or dl.kind == "del" and "diff_old"
+    or "item"
+  local text_spans
+  if state.hl and state.hl[i] and #state.hl[i] > 0 then
+    text_spans = state.hl[i]
+  else
+    text_spans = { { dl.text, base } }
+  end
+  local spans = {
+    { c and COMMENT_MARK or "  ", "warning" },
+    { string.format("%4d ", ln or 0), "dim" },
+    { sign .. " ", base },
+  }
+  return spans, text_spans
+end
+
+local function line_bg(dl, selected, tint)
+  if selected then
+    return tint.sel
+  elseif dl.kind == "add" then
+    return tint.add
+  elseif dl.kind == "del" then
+    return tint.del
+  end
+end
+
+-- One half of a split row, exactly `hw` columns wide.
+local function side_cell(state, i, side, hw, tint, vfrom, vto)
+  if not i then
+    return { { string.rep(" ", hw), "" } }
+  end
+  local spans, text_spans = code_spans(state, i, side)
+  for _, sp in ipairs(truncate_spans(text_spans, math.max(hw - 9, 1))) do
+    spans[#spans + 1] = { sp[1], sp[2] }
+  end
+  local bg = line_bg(state.dlines[i], vfrom and i >= vfrom and i <= vto, tint)
+  if bg then
+    spans = with_bg(spans, bg)
+    pad_spans(spans, hw, { bg = bg })
+  else
+    pad_spans(spans, hw, "")
+  end
+  return spans
+end
+
+-- Pairs dlines into split rows: { hunk = i } or { old = i?, new = i? }.
+local function split_rows(dlines)
+  local rows, i = {}, 1
+  while i <= #dlines do
+    local dl = dlines[i]
+    if dl.kind == "hunk" then
+      rows[#rows + 1] = { hunk = i }
+      i = i + 1
+    elseif dl.kind == "ctx" then
+      rows[#rows + 1] = { old = i, new = i }
+      i = i + 1
+    else
+      local dels, adds = {}, {}
+      while dlines[i] and dlines[i].kind == "del" do
+        dels[#dels + 1] = i
+        i = i + 1
+      end
+      while dlines[i] and dlines[i].kind == "add" do
+        adds[#adds + 1] = i
+        i = i + 1
+      end
+      for k = 1, math.max(#dels, #adds) do
+        rows[#rows + 1] = { old = dels[k], new = adds[k] }
+      end
+    end
+  end
+  return rows
+end
+
+-- Side-by-side diff: old code left, new code right.
+local function render_split(state, lines, row_map, width, tint, vfrom, vto)
+  local editor_row
+  local active = state.pane == "diff"
+  local dlines, ch = state.dlines, state.change
+  local hw = math.max(math.floor((width - 1) / 2), 12)
+  state.drow_sides = {}
+  for _, row in ipairs(split_rows(dlines)) do
+    if row.hunk then
+      local spans = { { " " .. dlines[row.hunk].text, "accent" } }
+      lines[#lines + 1] = spans
+      row_map[#lines] = row.hunk
+      if active and #lines == state.dcursor and not state.centry then
+        lines[#lines] = pad_spans(restyle(spans, "selected"), width, "selected")
+      end
+      continue
+    end
+    local spans = side_cell(state, row.old, "old", hw, tint, vfrom, vto)
+    spans[#spans + 1] = { "│", "dim" }
+    for _, sp in ipairs(side_cell(state, row.new, "new", hw, tint, vfrom, vto)) do
+      spans[#spans + 1] = sp
+    end
+    lines[#lines + 1] = spans
+    row_map[#lines] = row.new or row.old
+    state.drow_sides[#lines] = row
+    if active and #lines == state.dcursor and not state.centry then
+      lines[#lines] = pad_spans(restyle(spans, "selected"), width, "selected")
+    end
+
+    local idxs = row.old == row.new and { row.old } or { row.old, row.new }
+    if state.centry then
+      for _, i in pairs(idxs) do
+        if state.centry.at == i then
+          editor_row = push_editor(state, lines, width)
+          break
+        end
+      end
+    end
+    local shown = {}
+    for _, i in pairs(idxs) do
+      local c = comment_at(ch, dlines[i])
+      if c and not shown[c] and comment_ends_at(dlines, c, i) then
+        shown[c] = true
+        push_comment(lines, c, width, tint)
+      end
+    end
+  end
+  return editor_row
+end
+
 -- Returns row_map (row -> dline idx), editor_row.
 local function render_diff(state)
   local width = math.max(state.rwidth, 20)
   local lines, row_map = {}, {}
   local ch = state.change
   local tint = get_tints()
+  state.drow_sides = nil
 
   if not ch then
     lines[#lines + 1] = { { "", "" } }
@@ -834,6 +1043,12 @@ local function render_diff(state)
     vto = math.max(state.vstart, state.vcur)
   end
 
+  if split_view then
+    local editor_row = render_split(state, lines, row_map, width, tint, vfrom, vto)
+    state.rbuf:set_lines(lines)
+    return row_map, editor_row
+  end
+
   local editor_row = nil
   local active = state.pane == "diff"
 
@@ -848,40 +1063,13 @@ local function render_diff(state)
       continue
     end
 
-    local selected = vfrom and i >= vfrom and i <= vto
-    local c = comment_at(ch, dl)
-    local ln = dl.kind == "del" and dl.old_ln or dl.new_ln
-    local sign = dl.kind == "add" and "+" or dl.kind == "del" and "-" or " "
-    local base = dl.kind == "add" and "diff_new"
-      or dl.kind == "del" and "diff_old"
-      or "item"
-
-    -- Code text: syntax-highlighted spans when available.
-    local text_spans
-    if state.hl and state.hl[i] and #state.hl[i] > 0 then
-      text_spans = state.hl[i]
-    else
-      text_spans = { { dl.text, base } }
-    end
-
-    local spans = {
-      { c and COMMENT_MARK or "  ", "warning" },
-      { string.format("%4d ", ln or 0), "dim" },
-      { sign .. " ", base },
-    }
+    local spans, text_spans = code_spans(state, i, nil)
     for _, sp in ipairs(text_spans) do
       spans[#spans + 1] = { sp[1], sp[2] }
     end
 
     -- Full-row background tint by line kind / selection.
-    local bg = nil
-    if selected then
-      bg = tint.sel
-    elseif dl.kind == "add" then
-      bg = tint.add
-    elseif dl.kind == "del" then
-      bg = tint.del
-    end
+    local bg = line_bg(dl, vfrom and i >= vfrom and i <= vto, tint)
     if bg then
       spans = with_bg(spans, bg)
       pad_spans(spans, width, { bg = bg })
@@ -895,41 +1083,14 @@ local function render_diff(state)
 
     -- Inline comment editor, right below the anchor line.
     if state.centry and state.centry.at == i then
-      lines[#lines + 1] = {
-        { "    ┌ ", "accent" },
-        { "Comment (" .. state.centry.label .. ")", "accent" },
-        { "  Enter: save  Esc: cancel", "dim" },
-      }
-      local r =
-        state.centry.input:render("    │ ", 6, math.max(width - 8, 20))
-      for _, l in ipairs(r.lines) do
-        lines[#lines + 1] = l
-        editor_row = #lines
-      end
-      lines[#lines + 1] = { { "    └", "accent" } }
+      editor_row = push_editor(state, lines, width)
     end
 
     -- Show the comment right below the last diff line it covers, in a
     -- full-width tinted block so it stands out from the code.
-    if c then
-      local nxt = dlines[i + 1]
-      if not (nxt and nxt.kind ~= "hunk" and covers(c, nxt)) then
-        local cbg = tint.com
-        local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
-        local txt = cbg and { bg = cbg, bold = true } or "warning"
-        local hdr = { { "    ┏ ", bar }, { "● Comment", bar } }
-        if cbg then
-          pad_spans(hdr, width, { bg = cbg })
-        end
-        lines[#lines + 1] = hdr
-        for _, cl in ipairs(wrap(c.text, math.max(width - 10, 20))) do
-          local cspans = { { COMMENT_BAR, bar }, { cl, txt } }
-          if cbg then
-            pad_spans(cspans, width, { bg = cbg })
-          end
-          lines[#lines + 1] = cspans
-        end
-      end
+    local c = comment_at(ch, dl)
+    if c and comment_ends_at(dlines, c, i) then
+      push_comment(lines, c, width, tint)
     end
   end
 
@@ -1024,6 +1185,18 @@ local function render_clamped(state, render, cur_key, buf)
   return map
 end
 
+-- Dims every row of an inactive panel except the cursor row, so the
+-- focused panel stands out.
+local function dim_panel(buf, keep_row)
+  local lines = buf:get_lines()
+  for r, spans in ipairs(lines) do
+    if r ~= keep_row then
+      lines[r] = restyle(spans, "dim")
+    end
+  end
+  buf:set_lines(lines)
+end
+
 local function redraw(state)
   -- Left column: files, commits, comments (stacked).
   state.frow_map = render_clamped(state, function(s)
@@ -1082,10 +1255,27 @@ local function redraw(state)
 
   local diff_active = state.pane == "diff" or state.centry ~= nil
 
+  if state.pane ~= "files" or state.centry then
+    dim_panel(state.fbuf, state.fcursor)
+  end
+  if state.pane ~= "commits" or state.centry then
+    dim_panel(state.cbuf, state.ccursor)
+  end
+  if state.pane ~= "comments" or state.centry then
+    dim_panel(state.mbuf, state.mcursor)
+  end
+
+  local function mark(title, active, keep_case)
+    if not active then
+      return title
+    end
+    return " ▶" .. (keep_case and title or title:upper()) .. "◀ "
+  end
+
   local function panel_cfg(win, title, active, footer)
     win:set_config({
-      title = title,
-      border = active and "double" or "rounded",
+      title = mark(title, active),
+      border = active and "double" or "single",
       footer = active and footer or { { "Tab", "focus" } },
     })
   end
@@ -1142,11 +1332,15 @@ local function redraw(state)
       .. " "
   end
   state.rwin:set_config({
-    title = rtitle,
-    border = diff_active and "double" or "rounded",
+    title = mark(rtitle, diff_active, true),
+    border = diff_active and "double" or "single",
     footer = state.centry
         and { { "Enter", "save" }, { "Esc", "cancel" } }
       or (diff_active and {
+          { "Tab", "next change" },
+        { "n/p", "file" },
+        { "t", split_view and "unified" or "split" },
+        { "f", full_file and "hunks" or "full file" },
         { "c", "comment" },
         { "v", state.vstart and "cancel select" or "select" },
         { "d", "delete" },
@@ -1154,6 +1348,29 @@ local function redraw(state)
         { "Esc", "back" },
       } or { { "Enter", "diff" } }),
   })
+
+  local where = state.centry and "editing comment"
+    or (state.pane == "diff" and "diff") or state.pane
+  local hints = { { "pane", where } }
+  if state.commit then
+    hints[#hints + 1] = { "commit", state.commit.sha }
+  end
+  if state.change then
+    hints[#hints + 1] = { "file", state.change.path }
+    hints[#hints + 1] = { "view", split_view and "split" or "unified" }
+    hints[#hints + 1] = { "show", full_file and "full file" or "hunks" }
+  end
+  if state.vstart then
+    hints[#hints + 1] = { "v", "selecting" }
+  end
+  hints[#hints + 1] = { tostring(#comments), #comments == 1 and "comment" or "comments" }
+  hints[#hints + 1] = { "?", "help" }
+  local bar = { { " REVIEW ", { bold = true, reversed = true } } }
+  for _, h in ipairs(hints) do
+    bar[#bar + 1] = { "  " .. h[1] .. " ", "accent" }
+    bar[#bar + 1] = { h[2], "dim" }
+  end
+  state.sbuf:set_lines({ bar })
 
   state.fwin:set_cursor(state.fcursor)
   state.cwin:set_cursor(state.ccursor)
@@ -1202,7 +1419,7 @@ local function load_preview(state)
     return
   end
 
-  local key = (ch.commit or "") .. ":" .. ch.path
+  local key = (full_file and "full:" or "") .. (ch.commit or "") .. ":" .. ch.path
   local cached = state.cache[key]
   if not cached then
     local dlines, err = get_diff(ch)
@@ -1372,6 +1589,102 @@ local function set_active_cursor(state, r)
   end
 end
 
+-- Rows in the diff pane where a change block (run of +/- lines) or a
+-- comment starts, in display order.
+local function block_rows(state)
+  local rows = {}
+  local dlines, ch = state.dlines, state.change
+  if not dlines or not ch then
+    return rows
+  end
+  local max = 0
+  for r in pairs(state.drow_map) do
+    max = math.max(max, r)
+  end
+  local prev_changed, prev_c = false, nil
+  for r = 1, max do
+    local i = state.drow_map[r]
+    local dl = i and dlines[i]
+    if dl and dl.kind == "hunk" then
+      prev_changed, prev_c = false, nil
+    elseif dl then
+      local sides = state.drow_sides and state.drow_sides[r]
+      local idxs = sides and { sides.old, sides.new } or { i }
+      local changed, c = false, nil
+      for _, k in pairs(idxs) do
+        local kd = dlines[k]
+        changed = changed or kd.kind == "add" or kd.kind == "del"
+        c = c or comment_at(ch, kd)
+      end
+      if (changed and not prev_changed) or (c and c ~= prev_c) then
+        rows[#rows + 1] = r
+      end
+      prev_changed, prev_c = changed, c
+    end
+  end
+  return rows
+end
+
+-- Moves the diff cursor to the next (dir = 1) or previous (dir = -1)
+-- change block or comment, wrapping around.
+local function jump_block(state, dir)
+  local rows = block_rows(state)
+  if #rows == 0 then
+    maki.ui.flash("No changes or comments in this diff")
+    return
+  end
+  local target
+  if dir > 0 then
+    for _, r in ipairs(rows) do
+      if r > state.dcursor then
+        target = r
+        break
+      end
+    end
+    target = target or rows[1]
+  else
+    for k = #rows, 1, -1 do
+      if rows[k] < state.dcursor then
+        target = rows[k]
+        break
+      end
+    end
+    target = target or rows[#rows]
+  end
+  set_active_cursor(state, target)
+end
+
+-- From the diff pane, opens the next (dir = 1) or previous (dir = -1)
+-- file in the source tree (Files, or the open commit's files).
+local function step_file(state, dir)
+  local ckey, map
+  if state.src == "files" then
+    ckey, map = "fcursor", state.frow_map
+  elseif state.src == "commits" and state.commit then
+    ckey, map = "ccursor", state.crow_map
+  else
+    maki.ui.flash("No file list to step through")
+    return
+  end
+  local max = 0
+  for r in pairs(map) do
+    max = math.max(max, r)
+  end
+  local r = state[ckey] + dir
+  while r >= 1 and r <= max do
+    if type(map[r]) == "number" then
+      state[ckey] = r
+      state.vstart = nil
+      state.vshift = nil
+      load_preview(state)
+      redraw(state)
+      return
+    end
+    r = r + dir
+  end
+  maki.ui.flash(dir > 0 and "Last file" or "First file")
+end
+
 local function move(state, dir, count)
   count = count or 1
   local cursor, row_map, buf = active_view(state)
@@ -1486,12 +1799,12 @@ end
 
 local function layout()
   local sz = maki.ui.terminal_size()
-  local w = math.floor(sz.cols * 0.94)
-  local h = math.floor(sz.rows * 0.86)
+  local w = sz.cols
+  local h = math.max(sz.rows - 2, 10)
   local lw = math.max(28, math.min(46, math.floor(w * 0.30)))
   local rw = w - lw
-  local row = math.max(math.floor((sz.rows - h) / 2) - 1, 0)
-  local col = math.floor((sz.cols - w) / 2)
+  local row = 0
+  local col = 0
   local fh = math.max(math.floor(h * 0.38), 5)
   local ch = math.max(math.floor(h * 0.34), 5)
   local mh = math.max(h - fh - ch, 4)
@@ -1510,12 +1823,21 @@ end
 -- Opens (or reopens) all panes. Only the Files window takes focus and
 -- receives keys; the other windows are display-only.
 local function open_windows(state)
-  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
+  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin" }) do
     if state[w] then
       state[w]:close()
     end
   end
   local L = layout()
+  state.swin = maki.ui.open_win(state.sbuf, {
+    width = L.lw + L.rw,
+    height = 1,
+    row = L.row + L.h,
+    col = L.col,
+    anchor = "NW",
+    border = "none",
+    focus = false,
+  })
   state.rwin = maki.ui.open_win(state.rbuf, {
     title = " Diff ",
     width = L.rw,
@@ -1561,6 +1883,112 @@ local function open_windows(state)
   state.term = maki.ui.terminal_size()
 end
 
+local MOVE_KEYS = {
+  ["<Up>"] = true, ["<Down>"] = true, k = true, j = true,
+  ["<PageUp>"] = true, ["<PageDown>"] = true,
+  g = true, G = true, ["<Home>"] = true, ["<End>"] = true,
+  ["<Tab>"] = true, ["<S-Tab>"] = true,
+}
+
+--- help overlay ------------------------------------------------------------
+
+local HELP = {
+  {
+    "Global",
+    {
+      { "?", "toggle this help" },
+      { "Tab", "cycle Files → Commits → Comments (left panes)" },
+      { "↑ ↓ / k j", "move cursor" },
+      { "PgUp PgDn", "move one page" },
+      { "g / Home", "jump to top" },
+      { "G / End", "jump to bottom" },
+      { "s", "submit comments to a new session" },
+      { "q / Ctrl-C", "close review" },
+    },
+  },
+  {
+    "Files / Commits / Comments",
+    {
+      { "Enter / l / →", "open diff, expand dir, open commit" },
+      { "h / ←", "collapse dir, leave commit" },
+      { "r", "refresh from git" },
+      { "d", "delete comment (Comments pane)" },
+      { "Esc", "leave commit, or close review" },
+    },
+  },
+  {
+    "Diff",
+    {
+      { "Tab / Shift-Tab", "next / previous change block or comment" },
+      { "t", "toggle unified / side-by-side view" },
+      { "f", "toggle changed hunks / whole file" },
+      { "n / p", "next / previous file in the tree" },
+      { "c / Enter", "comment on line or selection" },
+      { "v", "start / cancel range selection" },
+      { "Shift-↑ ↓", "select range (ends on next plain move)" },
+      { "d", "delete comment under cursor" },
+      { "h / ← / Esc", "cancel selection, or go back" },
+    },
+  },
+  {
+    "Comment editor",
+    {
+      { "Enter", "save comment" },
+      { "Esc / Ctrl-C", "cancel" },
+    },
+  },
+}
+
+local function is_help_key(key)
+  return key == "?"
+end
+
+local function close_help(state)
+  if state.hwin then
+    state.hwin:close()
+    state.hwin = nil
+  end
+end
+
+local function open_help(state)
+  close_help(state)
+  local kw = 0
+  for _, sec in ipairs(HELP) do
+    for _, item in ipairs(sec[2]) do
+      kw = math.max(kw, display_len(item[1]))
+    end
+  end
+  local buf = maki.ui.buf()
+  local width = 0
+  for i, sec in ipairs(HELP) do
+    if i > 1 then
+      buf:line("")
+    end
+    buf:line({ { " " .. sec[1], "accent" } })
+    for _, item in ipairs(sec[2]) do
+      local pad = string.rep(" ", kw - display_len(item[1]))
+      buf:line({ { "   " .. item[1] .. pad, "warning" }, { "   " .. item[2] } })
+      width = math.max(width, 6 + kw + display_len(item[2]))
+    end
+  end
+  local sz = maki.ui.terminal_size()
+  local w = math.min(width + 4, sz.cols - 2)
+  local h = math.min(buf:len() + 2, sz.rows - 2)
+  state.hwin = maki.ui.open_win(buf, {
+    title = " Review shortcuts ",
+    title_pos = "center",
+    border = "double",
+    width = w,
+    height = h,
+    row = math.max(math.floor((sz.rows - h) / 2), 0),
+    col = math.max(math.floor((sz.cols - w) / 2), 0),
+    anchor = "NW",
+    zindex = 200,
+    focus = false,
+    footer = { { "?/Esc", "close" } },
+  })
+end
+
 --- main loop ---------------------------------------------------------------
 
 local function open_review()
@@ -1575,6 +2003,7 @@ local function open_review()
     cbuf = maki.ui.buf(),
     mbuf = maki.ui.buf(),
     rbuf = maki.ui.buf(),
+    sbuf = maki.ui.buf(),
     pane = "files",
     src = "files",
     wchanges = changes,
@@ -1614,7 +2043,12 @@ local function open_review()
       -- (reopen -> initial resize -> reopen ...).
       local sz = maki.ui.terminal_size()
       if sz.cols ~= state.term.cols or sz.rows ~= state.term.rows then
+        local had_help = state.hwin ~= nil
+        close_help(state)
         open_windows(state)
+        if had_help then
+          open_help(state)
+        end
       end
       redraw(state)
       continue
@@ -1631,11 +2065,23 @@ local function open_review()
     end
     local key = ev.key
 
+    -- Help overlay swallows keys while open; ?/Esc/q close it.
+    if state.hwin then
+      if is_help_key(key) or key == "<Esc>" or key == "q" then
+        close_help(state)
+      end
+      continue
+    end
+    if key == "?" and not state.centry then
+      open_help(state)
+      continue
+    end
+
     -- Comment editor owns the keyboard while open.
     if state.centry then
-      if key == "enter" then
+      if key == "<CR>" then
         save_comment(state)
-      elseif key == "esc" or key == "ctrl+c" then
+      elseif key == "<Esc>" or key == "<C-c>" then
         state.centry = nil
         redraw(state)
       else
@@ -1646,29 +2092,41 @@ local function open_review()
       continue
     end
 
-    if key == "up" or key == "k" then
+    -- A Shift-arrow selection ends with the next plain movement key, the
+    -- closest a terminal gets to "Shift released".
+    if state.vshift and MOVE_KEYS[key] then
+      state.vstart = nil
+      state.vshift = nil
+      redraw(state)
+    end
+
+    if key == "<Up>" or key == "k" then
       move(state, -1)
-    elseif key == "down" or key == "j" then
+    elseif key == "<Down>" or key == "j" then
       move(state, 1)
-    elseif key == "pageup" then
+    elseif key == "<PageUp>" then
       move(state, -1, math.max(active_height(state) - 2, 1))
-    elseif key == "pagedown" then
+    elseif key == "<PageDown>" then
       move(state, 1, math.max(active_height(state) - 2, 1))
-    elseif key == "g" or key == "home" then
+    elseif key == "g" or key == "<Home>" then
       jump(state, false)
-    elseif key == "G" or key == "end" then
+    elseif key == "G" or key == "<End>" then
       jump(state, true)
-    elseif key == "tab" then
-      set_pane(state, state.pane == "diff" and state.src or PANE_NEXT[state.pane])
+    elseif key == "<Tab>" or key == "<S-Tab>" then
+      if state.pane == "diff" then
+        jump_block(state, key == "<Tab>" and 1 or -1)
+      elseif key == "<Tab>" then
+        set_pane(state, PANE_NEXT[state.pane])
+      end
     elseif key == "s" then
       if submit(state) then
         return
       end
       redraw(state)
-    elseif key == "q" or key == "ctrl+c" then
+    elseif key == "q" or key == "<C-c>" then
       break
     elseif state.pane ~= "diff" then -- one of the left panels
-      if key == "enter" or key == "l" or key == "right" then
+      if key == "<CR>" or key == "l" or key == "<Right>" then
         if state.pane == "commits" and not state.commit then
           enter_commit(state)
         elseif state.pane == "comments" then
@@ -1686,7 +2144,7 @@ local function open_review()
         delete_selected_comment(state)
       elseif key == "r" then
         refresh(state)
-      elseif key == "h" or key == "left" then
+      elseif key == "h" or key == "<Left>" then
         local cursor, row_map = active_view(state)
         local sel = row_map[cursor]
         local set = state.pane == "commits" and state.ccollapsed
@@ -1701,7 +2159,7 @@ local function open_review()
         elseif state.pane == "commits" and state.commit then
           leave_commit(state)
         end
-      elseif key == "esc" then
+      elseif key == "<Esc>" then
         if state.pane == "commits" and state.commit then
           leave_commit(state)
         else
@@ -1709,9 +2167,52 @@ local function open_review()
         end
       end
     else -- diff pane
-      if key == "c" or key == "enter" then
+      if key == "<S-Up>" or key == "<S-Down>" then
+        if not state.vstart then
+          state.vstart = state.drow_map[state.dcursor]
+          state.vcur = state.vstart
+          state.vshift = state.vstart ~= nil
+        end
+        move(state, key == "<S-Up>" and -1 or 1)
+        redraw(state)
+      elseif key == "n" or key == "p" then
+        step_file(state, key == "n" and 1 or -1)
+      elseif key == "f" then
+        local cur = state.dlines and state.dlines[state.drow_map[state.dcursor] or 0]
+        full_file = not full_file
+        state.vstart = nil
+        state.vshift = nil
+        load_preview(state)
+        redraw(state)
+        if cur and cur.kind ~= "hunk" then
+          for r, i in pairs(state.drow_map) do
+            local dl = state.dlines[i]
+            if dl.kind == cur.kind and dl.old_ln == cur.old_ln and dl.new_ln == cur.new_ln then
+              state.dcursor = r
+              break
+            end
+          end
+          redraw(state)
+        end
+        maki.ui.flash(full_file and "Showing whole file" or "Showing changed hunks only")
+      elseif key == "t" then
+        split_view = not split_view
+        state.vstart = nil
+        state.vshift = nil
+        local anchor = state.drow_map[state.dcursor]
+        redraw(state)
+        for r, i in pairs(state.drow_map) do
+          local sides = state.drow_sides and state.drow_sides[r]
+          if i == anchor or (sides and (sides.old == anchor or sides.new == anchor)) then
+            state.dcursor = r
+            break
+          end
+        end
+        redraw(state)
+      elseif key == "c" or key == "<CR>" then
         open_comment_editor(state)
       elseif key == "v" then
+        state.vshift = nil
         if state.vstart then
           state.vstart = nil
         else
@@ -1721,7 +2222,7 @@ local function open_review()
         redraw(state)
       elseif key == "d" then
         delete_comment(state)
-      elseif key == "h" or key == "left" or key == "esc" then
+      elseif key == "h" or key == "<Left>" or key == "<Esc>" then
         if state.vstart then
           state.vstart = nil
           redraw(state)
@@ -1732,7 +2233,8 @@ local function open_review()
     end
   end
 
-  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
+  close_help(state)
+  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin", "swin" }) do
     if state[w] then
       state[w]:close()
     end
