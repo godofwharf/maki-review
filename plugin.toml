@@ -1,0 +1,4 @@
+min_maki_version = "0.4.12"
+
+[permissions]
+run = true
